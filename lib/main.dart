@@ -1,12 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
-
 import 'package:flutter/material.dart';
 
-import 'services/mqtt_service.dart';
-import 'services/gps_service.dart';
+// Explicit relative paths to match your folder structure exactly
+import './services/mqtt_service.dart';
+import './services/gps_service.dart';
 
 void main() {
   runApp(const ScooterApp());
@@ -22,6 +21,10 @@ class ScooterApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.teal, 
+          brightness: Brightness.dark
+        ),
       ),
       home: const DashboardPage(),
     );
@@ -32,268 +35,234 @@ class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
 
   @override
-  State<DashboardPage> createState() =>
-      _DashboardPageState();
+  State<DashboardPage> createState() => _DashboardPageState();
 }
 
-class _DashboardPageState
-    extends State<DashboardPage> {
-
+class _DashboardPageState extends State<DashboardPage> {
   final mqtt = MQTTService();
-
   final gps = GPSService();
 
-  final TextEditingController
-      destinationController =
-      TextEditingController();
+  late final TextEditingController ipController;
+  final TextEditingController destinationController = TextEditingController();
 
-  bool connected = false;
-
-  String brokerIp =
-      "10.120.88.50";
+  // Tracks uploaded file names in the session to execute delete requests easily
+  final List<String> _sessionDocuments = [];
 
   @override
   void initState() {
     super.initState();
+    // Initialize controller once to prevent typing refresh glitches
+    ipController = TextEditingController(text: "10.120.88.50");
+
+    // Rebuild UI dynamically whenever MQTT connection status flags change
+    mqtt.addListener(() {
+      if (mounted) setState(() {});
+    });
   }
 
-  Future<void> connectBroker() async {
+  @override
+  void dispose() {
+    ipController.dispose();
+    destinationController.dispose();
+    gps.stop();
+    mqtt.dispose();
+    super.dispose();
+  }
+
+  Future<void> toggleBrokerConnection() async {
+    if (mqtt.isConnected) {
+      await gps.stop();
+      mqtt.disconnect();
+      return;
+    }
+
     try {
-      await mqtt.connect(
-        brokerIp,
-      );
+      bool success = await mqtt.connect(ipController.text.trim());
 
-      gps.start(
-        mqtt,
-      );
-
-      setState(() {
-        connected = true;
-      });
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context)
-          .showSnackBar(
-        const SnackBar(
-          content:
-              Text("MQTT Connected"),
-        ),
-      );
+      if (success) {
+        await gps.start(mqtt);
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("MQTT Connected & GPS Streaming")),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
-
-      ScaffoldMessenger.of(context)
-          .showSnackBar(
-        SnackBar(
-          content: Text(
-            "Connection Failed: $e",
-          ),
-        ),
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Connection Failed: $e")),
       );
     }
   }
 
   void sendDestination() {
-    if (!connected) return;
+    if (!mqtt.isConnected) return;
 
+    // Matches specification topic: scooter/destination
     mqtt.publish(
-      "scooter/navigation",
-      {
-        "destination":
-            destinationController.text
-      },
+      "scooter/destination",
+      {"destination": destinationController.text.trim()},
     );
 
-    ScaffoldMessenger.of(context)
-        .showSnackBar(
-      const SnackBar(
-        content: Text(
-          "Destination Sent",
-        ),
-      ),
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Destination route payload sent")),
     );
   }
 
   Future<void> uploadDocument() async {
+    if (!mqtt.isConnected) return;
 
-  if (!connected) {
-    return;
+    // Filter to accept precisely what your Pi backend expects
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'jpg', 'png', 'txt'],
+    );
+
+    if (result == null || result.files.single.path == null) return;
+
+    File file = File(result.files.single.path!);
+    List<int> bytes = await file.readAsBytes();
+    String encoded = base64Encode(bytes);
+    String filename = result.files.single.name;
+
+    // Matches specification payload: scooter/docs/upload
+    mqtt.publish(
+      "scooter/docs/upload",
+      {
+        "filename": filename,
+        "file": encoded,
+      },
+    );
+
+    setState(() {
+      if (!_sessionDocuments.contains(filename)) {
+        _sessionDocuments.add(filename);
+      }
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("$filename converted to Base64 and uploaded")),
+    );
   }
 
-  FilePickerResult? result =
-      await FilePicker.platform
-          .pickFiles();
+  void deleteDocument(String filename, int index) {
+    if (!mqtt.isConnected) return;
 
-  if (result == null) {
-    return;
+    // Matches specification payload: scooter/docs/delete
+    mqtt.publish(
+      "scooter/docs/delete",
+      {"filename": filename},
+    );
+
+    setState(() {
+      _sessionDocuments.removeAt(index);
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Deletion request sent for $filename")),
+    );
   }
-
-  File file = File(
-    result.files.single.path!,
-  );
-
-  List<int> bytes =
-      await file.readAsBytes();
-
-  String encoded =
-      base64Encode(bytes);
-
-  mqtt.publish(
-    "scooter/docs/upload",
-    {
-      "filename":
-          result.files.single.name,
-
-      "file":
-          encoded,
-    },
-  );
-
-  if (!mounted) return;
-
-  ScaffoldMessenger.of(context)
-      .showSnackBar(
-    SnackBar(
-      content: Text(
-        "${result.files.single.name} uploaded",
-      ),
-    ),
-  );
-}
 
   @override
-  Widget build(
-      BuildContext context) {
+  Widget build(BuildContext context) {
+    bool connected = mqtt.isConnected;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text(
-          "Scooter Companion",
-        ),
+        title: const Text("Scooter Companion Hub"),
+        centerTitle: true,
       ),
-      body: Padding(
-        padding:
-            const EdgeInsets.all(16),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
         child: Column(
-          crossAxisAlignment:
-              CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-
-            const Text(
-              "Pi MQTT Broker IP",
-              style: TextStyle(
-                fontWeight:
-                    FontWeight.bold,
-              ),
-            ),
-
-            const SizedBox(
-              height: 8,
-            ),
-
+            const Text("Pi MQTT Broker IP", style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
             TextField(
-              decoration:
-                  const InputDecoration(
-                border:
-                    OutlineInputBorder(),
+              controller: ipController,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(), 
+                hintText: "e.g. 10.120.88.50"
               ),
-              controller:
-                  TextEditingController(
-                text: brokerIp,
-              ),
-              onChanged: (value) {
-                brokerIp = value;
-              },
+              enabled: !connected,
             ),
-
-            const SizedBox(
-              height: 16,
-            ),
-
+            const SizedBox(height: 12),
             ElevatedButton(
-              onPressed:
-                  connectBroker,
-              child: Text(
-                connected
-                    ? "Connected"
-                    : "Connect",
+              onPressed: toggleBrokerConnection,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: connected ? Colors.redAccent : Colors.teal,
+                foregroundColor: Colors.white,
               ),
+              child: Text(connected ? "Disconnect Broker" : "Connect to Pi"),
             ),
-
-            const SizedBox(
-              height: 24,
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Icon(
+                  connected ? Icons.radar : Icons.gpp_bad, 
+                  color: connected ? Colors.greenAccent : Colors.redAccent
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  connected ? "Status: Live (GPS streaming every 2s)" : "Status: Disconnected",
+                  style: TextStyle(color: connected ? Colors.greenAccent : Colors.redAccent, fontWeight: FontWeight.bold),
+                ),
+              ],
             ),
-
-            Text(
-              connected
-                  ? "Status: Connected"
-                  : "Status: Disconnected",
-              style: TextStyle(
-                color: connected
-                    ? Colors.green
-                    : Colors.red,
-                fontWeight:
-                    FontWeight.bold,
-              ),
-            ),
-
-            const SizedBox(
-              height: 30,
-            ),
-
-            const Text(
-              "Destination",
-              style: TextStyle(
-                fontWeight:
-                    FontWeight.bold,
-              ),
-            ),
-
-            const SizedBox(
-              height: 8,
-            ),
-
+            const Divider(height: 40),
+            const Text("Navigation Target Sync", style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
             TextField(
-              controller:
-                  destinationController,
-              decoration:
-                  const InputDecoration(
-                hintText:
-                    "Enter destination",
-                border:
-                    OutlineInputBorder(),
+              controller: destinationController,
+              decoration: const InputDecoration(
+                hintText: "Enter destination (e.g. Puttur)", 
+                border: OutlineInputBorder()
               ),
+              enabled: connected,
             ),
-
-            const SizedBox(
-              height: 12,
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: connected ? sendDestination : null,
+              icon: const Icon(Icons.send),
+              label: const Text("Send Route Destination"),
             ),
-
-            ElevatedButton(
-              onPressed:
-                  sendDestination,
-              child: const Text(
-                "Send Route",
-              ),
+            const Divider(height: 40),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text("Document Sync Wallet", style: TextStyle(fontWeight: FontWeight.bold)),
+                ElevatedButton.icon(
+                  onPressed: connected ? uploadDocument : null,
+                  icon: const Icon(Icons.file_upload),
+                  label: const Text("Upload File"),
+                ),
+              ],
             ),
-
-            const SizedBox(
-              height: 30,
-            ),
-            const SizedBox(
-  height: 20,
-),
-
-ElevatedButton(
-  onPressed:
-      uploadDocument,
-  child: const Text(
-    "Upload Document",
-  ),
-),
-            const Text(
-              "GPS is automatically published every 2 seconds after connection.",
-            ),
+            const SizedBox(height: 12),
+            _sessionDocuments.isEmpty
+                ? const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8.0),
+                    child: Text("No files transferred during this session.", style: TextStyle(color: Colors.grey, fontSize: 13)),
+                  )
+                : ListView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: _sessionDocuments.length,
+                    itemBuilder: (context, index) {
+                      final file = _sessionDocuments[index];
+                      return Card(
+                        child: ListTile(
+                          leading: const Icon(Icons.file_present, color: Colors.tealAccent),
+                          title: Text(file, style: const TextStyle(fontSize: 14)),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                            onPressed: connected ? () => deleteDocument(file, index) : null,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
           ],
         ),
       ),
